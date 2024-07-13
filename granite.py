@@ -12,8 +12,9 @@ from transformers import (
 )
 from transformers.trainer_utils import get_last_checkpoint
 from collections import OrderedDict
+from dataclasses import dataclass, field
+from typing import Optional
 import utils.tool
-from utils.configue import Configure
 from utils.dataset_bird import TokenizedDataset
 from utils.trainer import EvaluateFriendlySeq2SeqTrainer
 from utils.training_arguments import WrappedSeq2SeqTrainingArguments
@@ -22,21 +23,28 @@ import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
+@dataclass
+class DataTrainingArguments:
+    train_data_path: Optional[str] = field(
+        default=None, metadata={"help": "Path to the training data."}
+    )
+    test_data_path: Optional[str] = field(
+        default=None, metadata={"help": "Path to the test data."}
+    )
+
 def main():
     os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
     logging.basicConfig(level=logging.INFO)
 
-    parser = HfArgumentParser((WrappedSeq2SeqTrainingArguments,))
+    parser = HfArgumentParser((WrappedSeq2SeqTrainingArguments, DataTrainingArguments))
     parser.add_argument("--granite_model_path", type=str, required=True, help="Path to the Granite model.")
-    training_args, other_args = parser.parse_args_into_dataclasses()
-    
-    if not training_args.cfg:
-        training_args.cfg = "default_config.yaml"
-    
-    print(f"training_args.cfg: {training_args.cfg}")
+    parser.add_argument("--data_store_path", type=str, required=True, help="Path to the dataset storage.")
+    parser.add_argument("--seq2seq_constructor", type=str, required=True, help="Seq2Seq constructor name.")
+    parser.add_argument("--evaluate_tool", type=str, required=True, help="Evaluation tool name.")
+    parser.add_argument("--bert_location", type=str, required=True, help="BERT model location.")
+    training_args, data_args, other_args = parser.parse_args_into_dataclasses()
     
     set_seed(training_args.seed)
-    args = Configure.Get(training_args.cfg)
 
     dist.init_process_group(backend='nccl')
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -44,11 +52,6 @@ def main():
 
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
-
-    if 'checkpoint-???' in args.bert.location:
-        args.bert.location = get_last_checkpoint(
-            os.path.dirname(args.bert.location.model_name_or_path))
-        logger.info(f"Resolve model_name_or_path to {args.bert.location.model_name_or_path}")
 
     last_checkpoint = None
     if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
@@ -66,33 +69,14 @@ def main():
 
     os.makedirs(training_args.output_dir, exist_ok=True)
 
-    if not args.arg_paths:
-        cache_root = os.path.join('output', 'cache')
-        os.makedirs(cache_root, exist_ok=True)
-        raw_datasets_split: datasets.DatasetDict = datasets.load_dataset(path=training_args.train_data_path,
-                                                                         cache_dir=args.dataset.data_store_path)
-        seq2seq_dataset_split: tuple = utils.tool.get_constructor(args.seq2seq.constructor)(args).to_seq2seq(
-            raw_datasets_split, cache_root)
-    else:
-        cache_root = os.path.join('output', 'cache')
-        os.makedirs(cache_root, exist_ok=True)
-        meta_tuning_data = {}
-        for task, arg_path in args.arg_paths:
-            task_args = Configure.Get(arg_path)
-            task_args.bert = args.bert
-            print('task_args.bert.location:', task_args.bert.location)
-            task_raw_datasets_split: datasets.DatasetDict = datasets.load_dataset(
-                path=task_args.dataset.loader_path,
-                cache_dir=task_args.dataset.data_store_path)
-            task_seq2seq_dataset_split: tuple = utils.tool.get_constructor(task_args.seq2seq.constructor)(task_args).\
-                to_seq2seq(task_raw_datasets_split, cache_root)
+    cache_root = os.path.join('output', 'cache')
+    os.makedirs(cache_root, exist_ok=True)
+    raw_datasets_split: datasets.DatasetDict = datasets.load_dataset(path=data_args.train_data_path,
+                                                                     cache_dir=other_args.data_store_path)
+    seq2seq_dataset_split: tuple = utils.tool.get_constructor(other_args.seq2seq_constructor)(other_args).to_seq2seq(
+        raw_datasets_split, cache_root)
 
-            meta_tuning_data[arg_path] = task_seq2seq_dataset_split
-
-        seq2seq_dataset_split: tuple = utils.tool.get_constructor(args.seq2seq.constructor)(args).\
-            to_seq2seq(meta_tuning_data)
-
-    evaluator = utils.tool.get_evaluator(args.evaluate.tool)(args)
+    evaluator = utils.tool.get_evaluator(other_args.evaluate_tool)(other_args)
 
     model = AutoModelForSeq2SeqLM.from_pretrained(training_args.granite_model_path).to(device)
     model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
@@ -104,14 +88,14 @@ def main():
     elif len(seq2seq_dataset_split) == 3:
         seq2seq_train_dataset, seq2seq_eval_dataset, seq2seq_test_dataset = seq2seq_dataset_split
     else:
-        raise ValueError("Other split not support yet.")
+        raise ValueError("Other split not supported yet.")
 
-    train_dataset = TokenizedDataset(args, training_args, tokenizer,
+    train_dataset = TokenizedDataset(other_args, training_args, tokenizer,
                                      seq2seq_train_dataset) if seq2seq_train_dataset else None
-    eval_dataset = TokenizedDataset(args, training_args, tokenizer,
+    eval_dataset = TokenizedDataset(other_args, training_args, tokenizer,
                                     seq2seq_eval_dataset) if seq2seq_eval_dataset else None
 
-    early_stopping_callback = EarlyStoppingCallback(early_stopping_patience=args.seq2seq.patience if args.seq2seq.patience else 5)
+    early_stopping_callback = EarlyStoppingCallback(early_stopping_patience=5)
     trainer = EvaluateFriendlySeq2SeqTrainer(
         args=training_args,
         model=model,
@@ -122,24 +106,12 @@ def main():
         eval_examples=seq2seq_eval_dataset,
         callbacks=[early_stopping_callback],
     )
-    print('Trainer build successfully.')
+    print('Trainer built successfully.')
 
     if training_args.load_weights_from:
         state_dict = torch.load(os.path.join(training_args.load_weights_from, transformers.WEIGHTS_NAME), map_location="cpu")
         trainer.model.load_state_dict(state_dict, strict=True)
         del state_dict
-
-    if args.load_multiple_prefix_module_weights_from:
-        reconstruct_state_dict = OrderedDict()
-        for task_name, module_weight_location in args.load_multiple_prefix_module_weights_from:
-            state_dict = torch.load(os.path.join(module_weight_location, transformers.WEIGHTS_NAME), map_location="cpu")
-            MULTI_PREFIX_ATTR_NAME = "multi_prefix"
-            for weight_name, stored_tensor in state_dict.items():
-                if str(weight_name).startswith("pretrain_model"):
-                    continue
-                reconstruct_state_dict['{}.{}.{}'.format(MULTI_PREFIX_ATTR_NAME, "_".join(task_name.split("_")[:-1]), weight_name)] = stored_tensor
-        trainer.model.load_state_dict(reconstruct_state_dict, strict=False)
-        del reconstruct_state_dict
 
     if training_args.do_train:
         checkpoint = None
@@ -183,7 +155,7 @@ def main():
 
         trainer.log_metrics("predict", metrics)
         trainer.save_metrics("predict", metrics)
-        
+
         # Save predictions to a file
         predictions = predict_results.predictions
         output_prediction_file = os.path.join(training_args.output_dir, "predictions.txt")
@@ -193,14 +165,13 @@ def main():
 
     dist.destroy_process_group()
 
-def classwrapper(sql, question_id, db_schema):
-    sql=trainer,evaluate 
-
 if __name__ == "__main__":
-    parser = HfArgumentParser((WrappedSeq2SeqTrainingArguments,))
-    parser.add_argument("--train_data_path", type=str, required=True, help="Path to the training data.")
-    parser.add_argument("--test_data_path", type=str, required=True, help="Path to the test data.")
+    parser = HfArgumentParser((WrappedSeq2SeqTrainingArguments, DataTrainingArguments))
     parser.add_argument("--granite_model_path", type=str, required=True, help="Path to the Granite model.")
-    training_args, other_args = parser.parse_args_into_dataclasses()
+    parser.add_argument("--data_store_path", type=str, required=True, help="Path to the dataset storage.")
+    parser.add_argument("--seq2seq_constructor", type=str, required=True, help="Seq2Seq constructor name.")
+    parser.add_argument("--evaluate_tool", type=str, required=True, help="Evaluation tool name.")
+    parser.add_argument("--bert_location", type=str, required=True, help="BERT model location.")
+    training_args, data_args, other_args = parser.parse_args_into_dataclasses()
 
     main()
